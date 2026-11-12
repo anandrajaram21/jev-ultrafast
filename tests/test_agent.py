@@ -1,6 +1,7 @@
 """Offline contracts for a dynamic operation/target policy. No paid APIs."""
 
 import json
+import os
 import time
 from copy import deepcopy
 from unittest.mock import Mock
@@ -318,3 +319,76 @@ def test_navigation_during_prediction_reobserves_without_action(runner):
     assert runner.state["status"] == "ready"
     assert runner.state["decision"] is None
     runner.state["browser"].act.assert_not_called()
+
+
+def test_login_cookies_are_set_before_the_first_navigation(monkeypatch):
+    import jev_ultrafast.browser as browser
+
+    calls = []
+
+    def cdp(method, session_id=None, **params):
+        calls.append(method)
+        return {"targetId": "t", "sessionId": "s", "result": {"value": "complete"}}
+
+    monkeypatch.setattr(browser, "cdp", cdp)
+    cookies = [{"name": "session", "value": "secret", "domain": "site.test", "path": "/"}]
+    browser.Browser("https://site.test/admin", cookies=cookies)
+    assert calls.index("Network.setCookies") < calls.index("Page.navigate")
+
+
+def test_environment_prefers_shell_then_project_then_user_config(monkeypatch, tmp_path):
+    from jev_ultrafast import demo
+
+    config = tmp_path / "config.env"
+    config.write_text("JEV_A=config\nJEV_B=config\nJEV_C=config\n")
+    (tmp_path / ".env").write_text('JEV_B="project"\nJEV_C=project\n')
+    monkeypatch.setattr(demo, "CONFIG", config)
+    monkeypatch.chdir(tmp_path)
+    for key in ("JEV_A", "JEV_B"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("JEV_C", "shell")
+    demo.load_environment()
+    assert (os.environ["JEV_A"], os.environ["JEV_B"], os.environ["JEV_C"]) == ("config", "project", "shell")
+
+
+@pytest.mark.parametrize("final, failure, code", [("done", None, 0), ("blocked", None, 1), ("ready", "HTTP 404", 2)])
+def test_run_command_reports_status_and_writes_a_trace(monkeypatch, tmp_path, capsys, final, failure, code):
+    from jev_ultrafast import cli
+
+    state = {"status": final, "elapsed_ms": 4277, "decisions": [{}] * 6, "text_calls": [{}] * 2,
+             "history": [{"action": "Save draft", "operation": "CLICK", "elapsed_ms": 3675}],
+             "page": {"url": "https://site.test/done"}}
+    received = {}
+
+    class FakeAgent:
+        def __init__(self, url, goals, cookies=None):
+            received.update(url=url, goals=goals, cookies=cookies)
+
+        def run(self):
+            if failure:
+                raise RuntimeError(failure)
+            yield state
+
+        def snapshot(self):
+            return state
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(cli, "Agent", FakeAgent)
+    monkeypatch.setattr(cli.demo, "load_environment", lambda: None)
+    cookies, trace = tmp_path / "cookies.json", tmp_path / "trace.json"
+    cookies.write_text('[{"name": "session", "value": "secret", "url": "https://site.test"}]')
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["run", "--url", "https://site.test", "--goal", "First", "--goal", "Second",
+                  "--cookies", str(cookies), "--trace", str(trace)])
+    assert exit_info.value.code == code
+    assert received == {"url": "https://site.test", "goals": ["First", "Second"],
+                        "cookies": [{"name": "session", "value": "secret", "url": "https://site.test"}]}
+    assert json.loads(trace.read_text())["status"] == final
+    out = capsys.readouterr().out
+    assert "8 model calls" in out
+    assert out.count("Save draft") == (0 if failure else 1)

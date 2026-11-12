@@ -98,6 +98,33 @@ uv run --env-file .env python examples/run.py \
 
 `uv run --env-file .env python examples/flights.py --keep-open` performs the flight search, checks the actual route/date/results, and saves its trace. It does not select or book a flight.
 
+## Use it in other projects
+
+Install the `jev` command once. It needs [agent-browser](https://github.com/vercel-labs/agent-browser) on `PATH`.
+
+```bash
+uv tool install git+https://github.com/anandrajaram21/jev-ultrafast
+mkdir -p ~/.config/jev-ultrafast && cp .env.example ~/.config/jev-ultrafast/.env  # then add your keys
+```
+
+Settings come from the shell first, then the current project's `.env`, then `~/.config/jev-ultrafast/.env`. Run one goal from any project:
+
+```bash
+jev run --url https://mysite.local/wp-admin/post-new.php \
+  --goal "Create a draft post titled 'Release notes' with one paragraph 'Coming soon.' Do not publish it." \
+  --cookies login.json --trace trace.json
+```
+
+`--cookies` takes a JSON list of [CDP cookies](https://chromedevtools.github.io/devtools-protocol/tot/Network/#type-CookieParam), set before the first page load. Use it to sign in to a site under test without putting a password in the goal, which is sent to the model providers. For a local WordPress site, WP-CLI can mint short-lived cookies:
+
+```bash
+wp eval '$e=time()+900; echo json_encode([
+  ["name"=>LOGGED_IN_COOKIE, "value"=>wp_generate_auth_cookie(1,$e,"logged_in"), "url"=>home_url("/")],
+  ["name"=>SECURE_AUTH_COOKIE, "value"=>wp_generate_auth_cookie(1,$e,"secure_auth"), "url"=>admin_url()]]);' > login.json
+```
+
+`jev run` prints each action and a summary, then exits 0 when the model chose `DONE`, 1 when it stopped as blocked, and 2 on an error. `DONE` is not proof, so check the outcome yourself, for example with `wp post list` or an API call. In Python, pass the same list as `Agent(url, goal, cookies=...)`. `jev` with no arguments still opens the inspector.
+
 ## Why it moves
 
 - **One request per decision cycle.** Operation and target heads share the same observed state.
@@ -121,6 +148,7 @@ Every executed target is resolved from an observed node. The executor rechecks p
 | [model.py](jev_ultrafast/model.py) | Dynamic operation/target heads and text generation |
 | [questions.py](jev_ultrafast/questions.py) | Model instructions |
 | [demo.py](jev_ultrafast/demo.py) | Local inspector |
+| [cli.py](jev_ultrafast/cli.py) | `jev run` for any site and goal |
 
 ## Evidence and limits
 

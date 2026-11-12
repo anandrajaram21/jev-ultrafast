@@ -20,9 +20,14 @@ LOCK = threading.Lock()
 AGENT = None
 
 
+CONFIG = Path.home() / ".config" / "jev-ultrafast" / ".env"
+
+
 def load_environment():
-    path = Path.cwd() / ".env"
-    if path.exists():
+    """The shell wins, then the current project's .env, then the user-wide config."""
+    for path in (Path.cwd() / ".env", CONFIG):
+        if not path.exists():
+            continue
         for line in path.read_text().splitlines():
             if "=" in line and not line.startswith("#"):
                 key, value = line.split("=", 1)

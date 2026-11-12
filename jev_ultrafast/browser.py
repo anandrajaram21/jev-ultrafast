@@ -101,9 +101,12 @@ def drain_events():
 
 
 class Browser:
-    def __init__(self, url):
+    def __init__(self, url, cookies=None):
         self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
+        if cookies:
+            # Caller-supplied CDP cookies (e.g. a test login), set before the first request and never logged.
+            self.call("Network.setCookies", cookies=list(cookies))
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
         # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
