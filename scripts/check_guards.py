@@ -124,6 +124,62 @@ def main():
         assert value == "Generated", repr(value)
         assert any(a.get("role") == "option" for a in page["actions"])
         passed.append("real text input waits for asynchronous combobox suggestions")
+
+        # A same-origin frame, like the block editor canvas: offset, hit-tested, typed into, and scrolled in place.
+        browser.evaluate("document.body.innerHTML=" + repr(
+            '<div style="height:120px"></div><iframe id="canvas" title="Editor canvas" '
+            'style="width:600px;height:300px;border:4px solid;padding:6px"></iframe>'))
+        browser.evaluate("(() => { const d=document.querySelector('#canvas').contentDocument; d.open(); d.write("
+                         + repr('<p id="note">Draft saved locally</p>'
+                                '<button id="save" onclick="window.clicks=(window.clicks||0)+1">Save draft</button>'
+                                '<h1 contenteditable="true" aria-label="Add title"></h1>'
+                                '<div style="height:2000px"></div><button>Far below</button>')
+                         + "); d.close(); })()")
+        frame = "document.querySelector('#canvas').contentWindow"
+        page = browser.observe(screenshot=False)
+        save = next(a for a in page["actions"] if a["label"] == "Save draft")
+        assert save["rect"]["y"] > 120, save["rect"]
+        assert "Draft saved locally" in page["text"]
+        assert not any(a["label"] == "Far below" for a in page["actions"])
+        passed.append("same-origin frame controls and text are observed at their page position")
+
+        browser.act(save, page)
+        assert browser.evaluate(frame + ".clicks") == 1
+        passed.append("frame button clicked through its parent frame")
+
+        page = browser.observe(screenshot=False)
+        title = next(a for a in page["actions"] if a["kind"] == "fill" and a["label"] == "Add title")
+        browser.act(title, page, text="Hello from Jev")
+        assert browser.evaluate(frame + ".document.querySelector('h1').innerText") == "Hello from Jev"
+        passed.append("frame contenteditable receives real text input")
+
+        page = browser.observe(screenshot=False)
+        save = next(a for a in page["actions"] if a["label"] == "Save draft")
+        browser.evaluate(frame + ".document.querySelector('#note').textContent='Draft deleted'")
+        assert not browser.fresh(page, save)
+        passed.append("frame context change invalidates action-specific guard")
+
+        page = browser.observe(screenshot=False)
+        save = next(a for a in page["actions"] if a["label"] == "Save draft")
+        browser.evaluate("(() => { const cover=document.createElement('div'); "
+                         "cover.style.cssText='position:fixed;inset:0;z-index:9999'; document.body.append(cover); })()")
+        try:
+            browser.act(save, page)
+        except (RuntimeError, StalePage):
+            pass
+        else:
+            raise AssertionError("Covered frame target was clicked")
+        assert browser.evaluate(frame + ".clicks") == 1
+        browser.evaluate("document.body.lastElementChild.remove()")
+        passed.append("parent overlay blocks frame input")
+
+        page = browser.observe(screenshot=False)
+        scroll = next(a for a in page["actions"] if a["id"] == "scroll_down")
+        assert "point" in scroll
+        browser.act(scroll, page)
+        browser.observe(screenshot=False)
+        assert browser.evaluate(frame + ".scrollY") > 0
+        passed.append("an unscrollable page scrolls its editor frame")
         browser.call("Page.navigate", url="about:blank")
         assert not browser.fresh(page, field)
         passed.append("navigation invalidates the old document")

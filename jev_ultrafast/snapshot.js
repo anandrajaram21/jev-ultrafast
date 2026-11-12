@@ -13,7 +13,7 @@
     if (!e || seen.has(e)) return '';
     seen.add(e);
     const referenced=(e.getAttribute('aria-labelledby')||'').split(/\s+/)
-      .map(id=>name(document.getElementById(id),seen)).filter(Boolean).join(' ');
+      .map(id=>name(e.ownerDocument.getElementById(id),seen)).filter(Boolean).join(' ');
     return referenced || e.getAttribute('aria-label') ||
       [...(e.labels||[])].map(l=>name(l,seen)).filter(Boolean).join(' ') ||
       (['button','submit','reset'].includes(e.type) ? e.value : '') || e.getAttribute('alt') ||
@@ -41,9 +41,53 @@
     }
     return null;
   };
-  cache.pageKey=()=>[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
-    [...document.querySelectorAll('input,textarea,select')].filter(safe)
-      .map(e=>[identity(e),e.value,e.checked,e.selectedIndex,e.disabled,e.readOnly])];
+  // Same-origin iframes, such as the block editor canvas, are read in place with their offset and
+  // visible clip. Cross-origin frames stay opaque.
+  const inset = f => {
+    const s=f.ownerDocument.defaultView.getComputedStyle(f);
+    return [f.clientLeft+parseFloat(s.paddingLeft), f.clientTop+parseFloat(s.paddingTop)];
+  };
+  cache.frames=()=>{
+    const frames=[], add=(doc,ox,oy,clip)=>{
+      frames.push({doc,win:doc.defaultView,ox,oy,clip});
+      for (const f of doc.querySelectorAll('iframe')) {
+        let inner=null;
+        try { inner=f.contentDocument; } catch {}
+        if (!inner?.body || !visible(f)) continue;
+        const r=f.getBoundingClientRect(), [dx,dy]=inset(f), x=ox+r.x+dx, y=oy+r.y+dy;
+        const box={l:Math.max(clip.l,x),t:Math.max(clip.t,y),
+          r:Math.min(clip.r,x+inner.defaultView.innerWidth),b:Math.min(clip.b,y+inner.defaultView.innerHeight)};
+        if (box.r>box.l && box.b>box.t) add(inner,x,y,box);
+      }
+    };
+    add(document,0,0,{l:0,t:0,r:innerWidth,b:innerHeight});
+    return frames;
+  };
+  // Top-level center of e, or null unless it is the hit target in its own frame and every parent frame.
+  cache.point=e=>{
+    let doc=e.ownerDocument, target=e;
+    const r=e.getBoundingClientRect();
+    if (!r.width || !r.height) return null;
+    let x=r.x+r.width/2, y=r.y+r.height/2;
+    for (;;) {
+      const win=doc.defaultView;
+      if (x<0 || y<0 || x>=win.innerWidth || y>=win.innerHeight || !target.contains(doc.elementFromPoint(x,y)))
+        return null;
+      if (doc===document) return {x,y};
+      const f=win.frameElement;
+      if (!f) return null;
+      const fr=f.getBoundingClientRect(), [dx,dy]=inset(f);
+      x+=fr.x+dx; y+=fr.y+dy; target=f; doc=f.ownerDocument;
+    }
+  };
+  cache.pageKey=()=>{
+    const frames=cache.frames();
+    return [performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
+      frames.flatMap(({doc})=>[...doc.querySelectorAll('input,textarea,select')]).filter(safe)
+        .map(e=>[identity(e),e.value,e.checked,e.selectedIndex,e.disabled,e.readOnly]),
+      frames.slice(1).map(({win})=>[win.performance.timeOrigin,win.location.href,win.scrollX,win.scrollY,
+        win.innerWidth,win.innerHeight])];
+  };
   cache.guard=e=>{
     if (!e?.isConnected || !visible(e)) return null;
     const scope=e.closest('form,dialog,[role="dialog"],article,li,tr,[role="row"]') || e.parentElement;
@@ -52,14 +96,14 @@
       e.getAttribute('aria-expanded'),e.getAttribute('aria-checked'),e.getAttribute('aria-selected'),
       e.getAttribute('href'),scope?.innerText?.slice(0,6000)||''];
   };
-  const actions=[];
-  for (const e of document.querySelectorAll(selector)) {
+  const actions=[], frames=cache.frames();
+  for (const {doc,ox,oy,clip} of frames) for (const e of doc.querySelectorAll(selector)) {
     if (!safe(e) || !visible(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) continue;
-    const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2, rname=role(e);
-    if (!rname || r.width<=0 || r.height<=0 || x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
+    const r=e.getBoundingClientRect(), x=ox+r.x+r.width/2, y=oy+r.y+r.height/2, rname=role(e);
+    if (!rname || r.width<=0 || r.height<=0 || x<clip.l || y<clip.t || x>=clip.r || y>=clip.b) continue;
     if (rname==='gridcell' && e.querySelector('button,[role="button"]')) continue;
     const base={node:identity(e),role:rname,label:name(e)||rname,
-      rect:{x:r.x,y:r.y,w:r.width,h:r.height}};
+      rect:{x:ox+r.x,y:oy+r.y,w:r.width,h:r.height}};
     for (const key of ['checked','selected','expanded']) {
       const value=e.getAttribute('aria-'+key);
       if (value!==null) base[key]=value;
@@ -79,29 +123,41 @@
       if (editable) actions.push({...base,kind:'click',value,label:'Open '+base.label});
     }
   }
-  const words=[], walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
-  const range=document.createRange(); let node,length=0;
-  while ((node=walker.nextNode()) && length<6000) {
-    const value=node.textContent.trim(), parent=node.parentElement;
-    if (!value || !parent || parent.closest('script,style,noscript,template') || !visible(parent)) continue;
-    range.selectNodeContents(node); const r=range.getBoundingClientRect();
-    if (r.width>0 && r.height>0 && r.bottom>0 && r.top<innerHeight && r.right>0 && r.left<innerWidth) {
-      words.push(value); length+=value.length;
+  const words=[]; let length=0;
+  for (const {doc,ox,oy,clip} of frames) {
+    const walker=doc.createTreeWalker(doc.body,NodeFilter.SHOW_TEXT), range=doc.createRange();
+    let node;
+    while ((node=walker.nextNode()) && length<6000) {
+      const value=node.textContent.trim(), parent=node.parentElement;
+      if (!value || !parent || parent.closest('script,style,noscript,template') || !visible(parent)) continue;
+      range.selectNodeContents(node); const r=range.getBoundingClientRect();
+      if (r.width>0 && r.height>0 && oy+r.bottom>clip.t && oy+r.top<clip.b && ox+r.right>clip.l && ox+r.left<clip.r) {
+        words.push(value); length+=value.length;
+      }
     }
   }
-  const text=words.join('\n').slice(0,6000), height=document.documentElement.scrollHeight;
+  const text=words.join('\n').slice(0,6000);
+  // Scroll the top page; if it cannot scroll, scroll the largest visible frame that can (the editor canvas).
+  const scrolls=({win})=>win.scrollY+win.innerHeight<win.document.documentElement.scrollHeight-2 || win.scrollY>0;
+  const area=({clip})=>(clip.r-clip.l)*(clip.b-clip.t);
+  const scroller=scrolls(frames[0]) ? frames[0] : frames.slice(1).filter(scrolls).sort((a,b)=>area(b)-area(a))[0] ||
+    frames[0];
+  const {win}=scroller, height=win.document.documentElement.scrollHeight;
+  const point=scroller===frames[0] ? {} :
+    {point:{x:(scroller.clip.l+scroller.clip.r)/2,y:(scroller.clip.t+scroller.clip.b)/2}};
   const page_key=cache.pageKey(), guards={};
   for (const a of actions) if (!(a.node in guards)) guards[a.node]=cache.guard(cache.nodes.get(a.node));
   // Compare meaning and identity. Geometry is always resolved and hit-tested just before input.
   const semantics=actions.map(({rect,...action})=>action);
   const marker=[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
-    document.title,text,semantics,page_key[6]];
+    document.title,text,semantics,page_key[6],page_key[7]];
   const omitted_actions=Math.max(0,actions.length-250);
   actions.splice(250);
   actions.forEach((a,i)=>a.id='e'+(i+1));
-  if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
-  if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
+  if (win.scrollY+win.innerHeight<height-2)
+    actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560,...point});
+  if (win.scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560,...point});
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
-    scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions};
+    scroll:{y:win.scrollY,height},actions,marker,page_key,guards,omitted_actions};
 })()

@@ -132,6 +132,7 @@ class Browser:
                     "Runtime.evaluate",
                     expression="""(action => new Promise(resolve => {
                       const field=window.__jevFast?.nodes.get(action.node);
+                      const doc=field?.ownerDocument || document, view=doc.defaultView;
                       const autocomplete=action.kind==='fill' && field?.getAttribute('role')==='combobox';
                       let frames=0, stopped=false;
                       const finish=()=>{stopped=true;resolve()};
@@ -140,11 +141,11 @@ class Browser:
                         if (stopped) return;
                         const ids=(field?.getAttribute('aria-controls')||field?.getAttribute('aria-owns')||'')
                           .split(/\\s+/).filter(Boolean);
-                        const roots=ids.length ? ids.map(id=>document.getElementById(id)).filter(Boolean) : [document];
+                        const roots=ids.length ? ids.map(id=>doc.getElementById(id)).filter(Boolean) : [doc];
                         const options=roots.flatMap(root=>[...root.querySelectorAll('[role="option"]')]);
                         if (++frames>=2 && (!autocomplete || options.some(e=>{
                           const r=e.getBoundingClientRect();
-                          return r.width && r.height && r.bottom>0 && r.top<innerHeight &&
+                          return r.width && r.height && r.bottom>0 && r.top<view.innerHeight &&
                             e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true});
                         }))) finish();
                         else requestAnimationFrame(ready);
@@ -218,19 +219,21 @@ def browser_operation(request):
         action = request["action"]
         kind = action["kind"]
         if kind == "scroll":
-            call("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650, deltaX=0, deltaY=action["delta"])
+            # The snapshot supplies a point only when the scroller is a frame; it is never model output.
+            x, y = (action["point"]["x"], action["point"]["y"]) if "point" in action else (550, 650)
+            call("Input.dispatchMouseEvent", type="mouseWheel", x=x, y=y, deltaX=0, deltaY=action["delta"])
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
             # Code-owned node IDs refer to actual observed elements, never model-generated selectors.
             target = evaluate("""(action => {
-              const e=window.__jevFast?.nodes.get(action.node);
+              const c=window.__jevFast, e=c?.nodes.get(action.node);
               if (!e?.isConnected || e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
                   !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
               if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
-              const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
-              if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight) return null;
-              if (!e.contains(document.elementFromPoint(x,y))) return null;
+              // Current top-level center, hit-tested in the element's frame and every parent frame.
+              const point=c.point(e);
+              if (!point) return null;
               if (action.kind==='select') {
                 if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&
                     !o.disabled && !o.closest('optgroup[disabled]'))) return null;
@@ -238,7 +241,7 @@ def browser_operation(request):
                 e.dispatchEvent(new Event('input',{bubbles:true}));
                 e.dispatchEvent(new Event('change',{bubbles:true}));
               }
-              return {x,y};
+              return point;
             })(""" + json.dumps(action) + ")")
             if target is None:
                 if kind == "select":
