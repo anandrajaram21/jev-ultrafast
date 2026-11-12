@@ -1,13 +1,17 @@
-"""Observed actions through Browser Harness; one CDP session, no per-step subprocess."""
+"""Observed actions over one CDP WebSocket; agent-browser only supplies the browser endpoint."""
 
 import hashlib
+import itertools
 import json
+import os
+import queue
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
-from browser_harness.admin import ensure_daemon
-from browser_harness.helpers import cdp
+from websockets.sync.client import connect
 
 # Atomically read visible content and controls, preserving actual DOM node identity.
 READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
@@ -17,9 +21,87 @@ class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+def endpoint():
+    """agent-browser launches (or reuses) its browser and reports the CDP URL."""
+    env = {"AGENT_BROWSER_SESSION": "jev-ultrafast", **os.environ}
+    result = subprocess.run(["agent-browser", "get", "cdp-url"], capture_output=True, text=True, env=env, timeout=60)
+    url = result.stdout.strip()
+    if result.returncode or not url.startswith("ws"):
+        raise RuntimeError(f"agent-browser has no CDP endpoint: {(result.stderr or result.stdout).strip()}")
+    return url
+
+
+class Connection:
+    """A reader thread routes replies to their callers and queues events for drain_events()."""
+
+    def __init__(self, url):
+        self.ws = connect(url, max_size=None, open_timeout=30)
+        self.ids = itertools.count(1)
+        self.waiting = {}
+        self.lock = threading.Lock()
+        self.events = queue.SimpleQueue()
+        self.closed = False
+        threading.Thread(target=self.read, daemon=True).start()
+
+    def read(self):
+        try:
+            for raw in self.ws:
+                message = json.loads(raw)
+                with self.lock:
+                    waiter = self.waiting.pop(message.get("id"), None)
+                (waiter or self.events).put(message)
+        except Exception:
+            pass
+        finally:
+            with self.lock:
+                self.closed = True
+                waiters, self.waiting = self.waiting, {}
+            for waiter in waiters.values():
+                waiter.put({"error": {"message": "CDP connection closed"}})
+
+    def send(self, method, session_id=None, timeout=30, **params):
+        waiter = queue.SimpleQueue()
+        with self.lock:
+            if self.closed:
+                raise RuntimeError("CDP connection closed")
+            message_id = next(self.ids)
+            self.waiting[message_id] = waiter
+        message = {"id": message_id, "method": method, "params": params}
+        if session_id:
+            message["sessionId"] = session_id
+        self.ws.send(json.dumps(message))
+        try:
+            reply = waiter.get(timeout=timeout)
+        except queue.Empty:
+            raise RuntimeError(f"{method} timed out") from None
+        if "error" in reply:
+            raise RuntimeError(f"{method}: {reply['error'].get('message')}")
+        return reply.get("result", {})
+
+
+CONNECTION = None
+
+
+def cdp(method, session_id=None, **params):
+    """Raw CDP on the shared connection. A failed call raises; it is never resent."""
+    global CONNECTION
+    if CONNECTION is None or CONNECTION.closed:
+        CONNECTION = Connection(endpoint())
+    return CONNECTION.send(method, session_id, **params)
+
+
+def drain_events():
+    events = []
+    while CONNECTION is not None:
+        try:
+            events.append(CONNECTION.events.get_nowait())
+        except queue.Empty:
+            break
+    return events
+
+
 class Browser:
     def __init__(self, url):
-        ensure_daemon()
         self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)

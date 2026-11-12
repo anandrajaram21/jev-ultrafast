@@ -8,11 +8,10 @@ import threading
 import time
 from pathlib import Path
 
-from browser_harness.helpers import drain_events
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from examples.flights import GOALS, URL, verify  # noqa: E402
 from jev_ultrafast import Agent  # noqa: E402
+from jev_ultrafast.browser import drain_events  # noqa: E402
 
 folder = Path(sys.argv[1] if len(sys.argv) > 1 else "artifacts/flights/recorded")
 folder.mkdir(parents=True, exist_ok=False)
@@ -37,7 +36,7 @@ def capture():
     try:
         while not stop.is_set():
             for event in drain_events():
-                if event["method"] != "Page.screencastFrame" or event.get("session_id") != agent.browser.session:
+                if event["method"] != "Page.screencastFrame" or event.get("sessionId") != agent.browser.session:
                     continue
                 p = event["params"]
                 timestamp = max(0, round((p["metadata"]["timestamp"] - epoch) * 1000))
