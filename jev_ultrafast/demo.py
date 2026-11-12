@@ -26,7 +26,10 @@ def load_environment():
         for line in path.read_text().splitlines():
             if "=" in line and not line.startswith("#"):
                 key, value = line.split("=", 1)
-                os.environ.setdefault(key, value)
+                value = value.strip()
+                if len(value) > 1 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                os.environ.setdefault(key.strip(), value)
 
 
 def response_state():
