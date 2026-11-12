@@ -282,21 +282,21 @@ def test_flight_verification_rejects_wrong_trip(changed):
 
     actual = {
         "url": "https://www.google.com/travel/flights/search?tfs=example",
-        "text": "Track prices from Zürich to London departing 2026-09-20",
+        "text": "Track prices from Zürich to London departing 2027-03-21",
         "actions": [
             {"label": k, "value": v}
             for k, v in [
                 ("Change ticket type. One way", "One way"),
                 ("Where from?", "Zürich"),
                 ("Where to?", "London"),
-                ("Departure", "Sun, Sep 20"),
-                ("Nonstop flight on Sunday, September 20. Select flight", ""),
+                ("Departure", "Sun, Mar 21"),
+                ("Nonstop flight on Sunday, March 21. Select flight", ""),
             ]
         ],
     }
     assert verify(actual)["passed"]
     if changed == "year":
-        actual["text"] = actual["text"].replace("2026", "2027")
+        actual["text"] = actual["text"].replace("2027", "2028")
     else:
         next(a for a in actual["actions"] if a["label"] == changed)["value"] = "wrong"
     assert not verify(actual)["passed"]

@@ -37,7 +37,7 @@ steps = [
     ("One way", "One way"),
     ("Zürich", "Zürich, Switzerland"),
     ("London", "London, United Kingdom"),
-    ("20 September", "Done. Search"),
+    ("21 March", "Done. Search"),
     ("Search flights", "Search"),
 ]
 for i in range(round((end + 500) * 30 / 1000)):
