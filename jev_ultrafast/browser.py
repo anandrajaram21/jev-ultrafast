@@ -225,6 +225,10 @@ def browser_operation(request):
             # The snapshot supplies a point only when the scroller is a frame; it is never model output.
             x, y = (action["point"]["x"], action["point"]["y"]) if "point" in action else (550, 650)
             call("Input.dispatchMouseEvent", type="mouseWheel", x=x, y=y, deltaX=0, deltaY=action["delta"])
+        elif kind == "key":
+            for event in ("keyDown", "keyUp"):
+                call("Input.dispatchKeyEvent", type=event, key="Enter", code="Enter", windowsVirtualKeyCode=13,
+                     **({"text": "\r"} if event == "keyDown" else {}))
         elif kind != "wait":
             if type(action["node"]) is not int:
                 raise ValueError("Invalid observed node")
@@ -235,7 +239,15 @@ def browser_operation(request):
                   !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return null;
               if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true')) return null;
               // Current top-level center, hit-tested in the element's frame and every parent frame.
-              const point=c.point(e);
+              // An offscreen target is revealed first: focus shows hover/focus-only controls, then scroll.
+              let point=c.point(e);
+              const r=e.getBoundingClientRect(), view=e.ownerDocument.defaultView;
+              const x=r.x+r.width/2, y=r.y+r.height/2;
+              if (!point && (x<0 || y<0 || x>=view.innerWidth || y>=view.innerHeight)) {
+                e.focus({preventScroll:true});
+                e.scrollIntoView({block:'center',inline:'nearest',behavior:'instant'});
+                point=c.point(e);
+              }
               if (!point) return null;
               if (action.kind==='select') {
                 if (e.tagName!=='SELECT' || ![...e.options].some(o=>o.value===action.value &&

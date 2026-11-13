@@ -123,7 +123,9 @@ wp eval '$e=time()+900; echo json_encode([
   ["name"=>SECURE_AUTH_COOKIE, "value"=>wp_generate_auth_cookie(1,$e,"secure_auth"), "url"=>admin_url()]]);' > login.json
 ```
 
-`jev run` prints each action and a summary, then exits 0 when the model chose `DONE`, 1 when it stopped as blocked, and 2 on an error. `DONE` is not proof, so check the outcome yourself, for example with `wp post list` or an API call. In Python, pass the same list as `Agent(url, goal, cookies=...)`. `jev` with no arguments still opens the inspector.
+Repeat `--goal` for ordered steps. The model sees only the current step (plus the finished ones and the next one for context), so `DONE` means that step is finished; the run ends after the last. Name controls as the page labels them: every step boundary is a judgement, and a goal that says "Edit" for an option labelled "Bulk edit" can stall there.
+
+`jev run` prints each action, each finished step and a summary, then exits 0 when the model chose `DONE`, 1 when it stopped as blocked, and 2 on an error. `DONE` is not proof. Pass `--check '<shell command>'` to make your own check decide: jev runs it after the goals, prints `check passed` or `check failed (exit N): <output>`, and exits 0 or 1 with it. `--keep-open` leaves the tab open, so `agent-browser` can inspect jev's last page (it switches to the newest tab). In Python, pass the same list as `Agent(url, goals, cookies=..., keep_open=...)`. `jev` with no arguments still opens the inspector.
 
 ## Why it moves
 
@@ -133,7 +135,8 @@ wp eval '$e=time()+900; echo json_encode([
 - **Validate the selected target.** Clicks check the document, form values, target, and nearby context. Animation alone does not force another prediction. Resolve current geometry and reject covered controls before input.
 - **Wait for useful state.** After typing into a combobox, wait for visible suggestions, capped at 200 ms. Other interactions get at most two animation frames or 50 ms. These reads happen after execution is logged.
 - **Keep hidden tabs rendering.** Focus emulation prevents background animation throttling without switching Chrome's visible tab.
-- **Send visible text.** Offscreen article bodies and footers do not fill the model context.
+- **Send visible text, but every nearby control.** Offscreen article bodies and footers do not fill the model context. Controls above or below the view are offered with an `offscreen` flag (all in view, plus the 60 nearest), each with the heading of its box, and the executor scrolls or focuses them into view on use. Row actions shown only on hover or focus are offered when their row is on the page.
+- **One text call per form.** The text helper returns the selected field's value and the values of any other empty fields the goal names explicitly; those are typed without further decisions. Fields the goal does not name stay empty.
 - **Reuse an interrupted text request.** A generated value survives a stale-page retry only if the entire text-helper input is unchanged.
 
 Every executed target is resolved from an observed node. The executor rechecks page freshness and click occlusion. Model output never becomes selectors, coordinates, shell commands, or executable JavaScript. Text-helper output must parse as a small JSON object before typing.
@@ -158,7 +161,7 @@ In six alternating runs with identical models and settings, both versions passed
 
 The same policy opened the requested Wikipedia article in **2.798 s** and passed a local hotel search/filter task in **1.896 s**. Runs, failures, source hashes, and measurement boundaries are in [performance.md](docs/performance.md).
 
-A `DONE` choice still requires independent outcome verification. The DOM reader handles common HTML and ARIA controls, not the full accessible-name specification. Same-origin iframes, such as the WordPress block editor canvas, are read and driven in place; cross-origin frames stay opaque. Shadow roots, canvas, uploads, pop-up tabs, nested scrolling, and arbitrary keyboard widgets remain outside this MVP. Owned tabs share agent-browser's browser profile.
+A `DONE` choice still requires independent outcome verification. The DOM reader handles common HTML and ARIA controls, not the full accessible-name specification. Same-origin iframes, such as the WordPress block editor canvas, are read and driven in place; cross-origin frames stay opaque. Enter is available in a focused text field. Shadow roots, canvas, uploads, pop-up tabs, nested scrolling, and other keyboard widgets remain outside this MVP. A decision that goes stale five times in a row without any action stops the run as blocked. Owned tabs share agent-browser's browser profile.
 
 ## Development
 

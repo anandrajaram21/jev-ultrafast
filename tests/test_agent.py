@@ -169,6 +169,9 @@ def runner():
         "page": p,
         "decision": decision(),
         "goal": "Find a book",
+        "plan": ["Find a book"],
+        "plan_index": 0,
+        "steps_done": [],
         "history": [],
         "decisions": [],
         "status": "predicted",
@@ -188,7 +191,7 @@ def test_stale_decision_is_consumed_before_any_mutation(runner):
 
 
 def test_generated_text_reused_only_for_identical_retry_context(runner, monkeypatch):
-    helper = Mock(return_value=("book", {"model": "test", "latency_ms": 10}))
+    helper = Mock(return_value=("book", {"model": "test", "latency_ms": 10}, {}))
     monkeypatch.setattr(loop, "field_text", helper)
     runner.state["browser"].act.side_effect = [StalePage("Changed before input"), None]
     with pytest.raises(StalePage):
@@ -201,7 +204,7 @@ def test_generated_text_reused_only_for_identical_retry_context(runner, monkeypa
 
 
 def test_changed_field_context_does_not_reuse_generated_text(runner, monkeypatch):
-    helper = Mock(return_value=("book", {"model": "test", "latency_ms": 10}))
+    helper = Mock(return_value=("book", {"model": "test", "latency_ms": 10}, {}))
     monkeypatch.setattr(loop, "field_text", helper)
     runner.state["browser"].act.side_effect = [StalePage("Changed before input"), None]
     with pytest.raises(StalePage):
@@ -361,7 +364,7 @@ def test_run_command_reports_status_and_writes_a_trace(monkeypatch, tmp_path, ca
     received = {}
 
     class FakeAgent:
-        def __init__(self, url, goals, cookies=None):
+        def __init__(self, url, goals, cookies=None, keep_open=False):
             received.update(url=url, goals=goals, cookies=cookies)
 
         def run(self):
@@ -392,3 +395,145 @@ def test_run_command_reports_status_and_writes_a_trace(monkeypatch, tmp_path, ca
     out = capsys.readouterr().out
     assert "8 model calls" in out
     assert out.count("Save draft") == (0 if failure else 1)
+
+
+def test_done_finishes_only_the_current_step_of_an_ordered_plan(runner):
+    runner.state["plan"] = ["Tick Dune.", "Click View post, then click the Fantasy link."]
+    runner.state["goal"] = loop.step_goal(runner.state["plan"], 0)
+    assert runner.state["goal"].startswith("Step 1 of 2: Tick Dune.")
+    assert "Next step, for context only; do not start it: Click View post" in runner.state["goal"]
+    runner.state["decision"] = decision("DONE")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "ready" and runner.state["plan_index"] == 1
+    assert "Step 2 of 2: Click View post, then click the Fantasy link." in runner.state["goal"]
+    assert "1. Tick Dune." in runner.state["goal"]
+    runner.state["decision"] = decision("DONE")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "done" and [s["step"] for s in runner.state["steps_done"]] == [1, 2]
+
+
+def test_a_single_goal_is_sent_unchanged():
+    assert loop.step_goal(["Find a book"], 0) == "Find a book"
+
+
+def form():
+    state = page()
+    state["actions"] = [
+        {"id": "e1", "kind": "fill", "label": "Title", "role": "textbox", "value": "", "node": 1},
+        {"id": "e2", "kind": "fill", "label": "ISBN", "role": "textbox", "value": "", "node": 2},
+        {"id": "e3", "kind": "fill", "label": "Pages", "role": "spinbutton", "value": "", "node": 3},
+        {"id": "e4", "kind": "fill", "label": "Notes", "role": "textbox", "value": "kept", "node": 4},
+    ]
+    state["fingerprint"] = fingerprint(state)
+    return state
+
+
+def test_one_text_answer_fills_the_other_named_empty_fields(runner, monkeypatch):
+    p = form()
+    runner.state["page"] = p
+    runner.state["browser"].observe.return_value = p
+    helper = Mock(return_value=("Mort", {"model": "test", "latency_ms": 10}, {"e3": "272", "e4": "x"}))
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    typed = [(c.args[0]["id"], c.kwargs["text"]) for c in runner.state["browser"].act.call_args_list]
+    assert typed == [("e1", "Mort"), ("e3", "272")]  # e4 already has a value and is never overwritten.
+    assert helper.call_count == 1 and [h["text"] for h in runner.state["history"]] == ["Mort", "272"]
+
+
+def test_follow_up_fill_stops_on_a_stale_page(runner, monkeypatch):
+    p = form()
+    runner.state["page"] = p
+    runner.state["browser"].observe.return_value = p
+    runner.state["browser"].act.side_effect = [None, StalePage("changed")]
+    monkeypatch.setattr(loop, "field_text", Mock(return_value=("Mort", {"model": "t", "latency_ms": 1},
+                                                                {"e2": "1", "e3": "2"})))
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["browser"].act.call_count == 2 and len(runner.state["history"]) == 1
+
+
+def test_field_context_offers_other_empty_fields_only():
+    p = form()
+    context = model.field_context("Add Mort", p["actions"][0], p, [])
+    assert [f["id"] for f in context["other_empty_fields"]] == ["e2", "e3"]
+
+
+@pytest.mark.parametrize("content, others", [
+    ('{"text":"Mort","other_fields":{"e3":"272","e2":null}}', {"e3": "272"}),
+    ('{"text":"Mort"}', {}),
+])
+def test_text_helper_returns_named_values_for_other_fields(monkeypatch, content, others):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", Mock(return_value={"choices": [{"message": {"content": content}}]}))
+    context = model.field_context("Add Mort", form()["actions"][0], form(), [])
+    assert model.field_text(context)[2] == others
+
+
+def test_text_helper_rejects_values_for_fields_it_was_not_offered(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    content = '{"text":"Mort","other_fields":{"e99":"x"}}'
+    monkeypatch.setattr(model, "post_json", Mock(return_value={"choices": [{"message": {"content": content}}]}))
+    with pytest.raises(ValueError, match="nothing typed"):
+        model.field_text(model.field_context("Add Mort", form()["actions"][0], form(), []))
+
+
+def test_enter_is_a_key_event_not_a_click(monkeypatch):
+    import jev_ultrafast.browser as browser
+
+    cdp = Mock(return_value={})
+    monkeypatch.setattr(browser, "cdp", cdp)
+    browser_operation({"operation": "act", "session": "s", "action": {"id": "press_enter", "kind": "key"}})
+    assert [c.kwargs["type"] for c in cdp.call_args_list] == ["keyDown", "keyUp"]
+    assert cdp.call_args_list[0].kwargs["key"] == "Enter"
+
+
+def test_offscreen_and_section_reach_the_target_head():
+    actions = [{"id": "e1", "kind": "click", "label": "Fantasy", "role": "checkbox", "node": 1,
+                "section": "Genres", "offscreen": "below"}]
+    elements, targets, _ = model.action_space(actions)
+    assert elements[0]["section"] == "Genres" and elements[0]["offscreen"] == "below"
+
+
+@pytest.mark.parametrize("command, code", [("true", 0), ("echo missing; false", 1)])
+def test_check_decides_the_exit_code(monkeypatch, capsys, command, code):
+    from jev_ultrafast import cli
+
+    state = {"status": "done", "elapsed_ms": 1, "decisions": [], "text_calls": [], "history": [],
+             "page": {"url": "https://site.test"}}
+
+    class FakeAgent:
+        def __init__(self, *_args, **kwargs):
+            assert kwargs["keep_open"] is True
+
+        def run(self):
+            yield state
+
+        def snapshot(self):
+            return state
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(cli, "Agent", FakeAgent)
+    monkeypatch.setattr(cli.demo, "load_environment", lambda: None)
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["run", "--url", "https://site.test", "--goal", "Go", "--check", command, "--keep-open"])
+    assert exit_info.value.code == code
+    assert ("check passed" if code == 0 else "check failed (exit 1): missing") in capsys.readouterr().out
+
+
+def test_an_unreachable_target_stops_as_blocked_instead_of_spending_the_budget(runner):
+    runner.state["status"] = "ready"
+    runner.state["browser"].act.side_effect = StalePage("covered")
+    runner.command = loop.Agent.command.__get__(runner)
+    for _ in range(loop.STALE_LIMIT):
+        runner.state["decisions"].append({"choice": "e3", "elapsed_ms": 0})
+    runner.state["decision"] = decision("e3")
+    with pytest.raises(StalePage):
+        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    import unittest.mock as um
+    with um.patch.object(loop, "choose", return_value={**decision("e3"), "probabilities": {"e3": 1.0}}):
+        runner.command("tick")
+    assert runner.state["status"] == "blocked"

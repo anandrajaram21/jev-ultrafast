@@ -88,22 +88,64 @@
       frames.slice(1).map(({win})=>[win.performance.timeOrigin,win.location.href,win.scrollX,win.scrollY,
         win.innerWidth,win.innerHeight])];
   };
-  cache.guard=e=>{
+  cache.guard=(e,texts=new Map())=>{
     if (!e?.isConnected || !visible(e)) return null;
     const scope=e.closest('form,dialog,[role="dialog"],article,li,tr,[role="row"]') || e.parentElement;
+    // innerText forces layout; controls sharing a row or form read it once per snapshot.
+    if (scope && !texts.has(scope)) texts.set(scope,scope.innerText?.slice(0,6000)||'');
     return [identity(e),role(e),name(e),e.value??null,e.checked??null,e.selectedIndex??null,
       e.readOnly??null,e.matches(':disabled'),e.getAttribute('aria-disabled'),
       e.getAttribute('aria-expanded'),e.getAttribute('aria-checked'),e.getAttribute('aria-selected'),
-      e.getAttribute('href'),scope?.innerText?.slice(0,6000)||''];
+      e.getAttribute('href'),scope ? texts.get(scope) : ''];
   };
+  // The nearest heading of an enclosing group, so lookalike controls ("Authors" box vs. menu) differ.
+  const heading=':scope>legend,:scope>h1,:scope>h2,:scope>h3,:scope>h4,:scope>[role="heading"],'+
+    ':scope>*>h2,:scope>*>h3,:scope>*>[role="heading"]';
+  // Memoized per ancestor: controls in one box share the work. A heading inside the box names it.
+  const headings=new Map();
+  const headingOf = a => {
+    if (!headings.has(a)) {
+      const h=[...a.querySelectorAll(heading)].find(h=>{
+        const r=h.getBoundingClientRect();
+        return visible(h) && r.width>2 && r.height>2;
+      });
+      headings.set(a,h ? [h,h.innerText.trim().replace(/\s+/g,' ').slice(0,60)] : null);
+    }
+    return headings.get(a);
+  };
+  const section = e => {
+    for (let a=e.parentElement, i=0; a && i<8; a=a.parentElement, i++) {
+      const h=headingOf(a);
+      if (h && h[1] && !h[0].contains(e)) return h[1];
+    }
+    return '';
+  };
+  // The top document is read whole: controls below or above the view are offered and scrolled to on use.
+  // Controls parked off the page (e.g. table row actions shown on hover or focus) are offered when their
+  // row is on the page, and revealed by focus on use. Frames stay clipped to their visible area.
+  const pageW=document.documentElement.scrollWidth, pageH=document.documentElement.scrollHeight;
   const actions=[], frames=cache.frames();
   for (const {doc,ox,oy,clip} of frames) for (const e of doc.querySelectorAll(selector)) {
     if (!safe(e) || !visible(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) continue;
     const r=e.getBoundingClientRect(), x=ox+r.x+r.width/2, y=oy+r.y+r.height/2, rname=role(e);
-    if (!rname || r.width<=0 || r.height<=0 || x<clip.l || y<clip.t || x>=clip.r || y>=clip.b) continue;
+    if (!rname || r.width<=0 || r.height<=0) continue;
+    let offscreen=null;
+    if (x<clip.l || y<clip.t || x>=clip.r || y>=clip.b) {
+      if (doc!==document) continue;
+      const px=x+scrollX, py=y+scrollY;
+      if (px>=0 && py>=0 && px<pageW && py<pageH) offscreen=y<0 ? 'above' : y>=innerHeight ? 'below' : 'beside';
+      else {
+        const row=e.closest('tr,[role="row"]')?.getBoundingClientRect();
+        if (!row || !row.height || row.bottom+scrollY<=0 || row.top+scrollY>=pageH) continue;
+        offscreen=row.top<0 ? 'above' : row.top>=innerHeight ? 'below' : 'hidden until focused';
+      }
+    }
     if (rname==='gridcell' && e.querySelector('button,[role="button"]')) continue;
     const base={node:identity(e),role:rname,label:name(e)||rname,
       rect:{x:ox+r.x,y:oy+r.y,w:r.width,h:r.height}};
+    const group=section(e);
+    if (group && group!==base.label) base.section=group;
+    if (offscreen) base.offscreen=offscreen;
     for (const key of ['checked','selected','expanded']) {
       const value=e.getAttribute('aria-'+key);
       if (value!==null) base[key]=value;
@@ -145,19 +187,38 @@
   const {win}=scroller, height=win.document.documentElement.scrollHeight;
   const point=scroller===frames[0] ? {} :
     {point:{x:(scroller.clip.l+scroller.clip.r)/2,y:(scroller.clip.t+scroller.clip.b)/2}};
-  const page_key=cache.pageKey(), guards={};
-  for (const a of actions) if (!(a.node in guards)) guards[a.node]=cache.guard(cache.nodes.get(a.node));
+  const page_key=cache.pageKey(), guards={}, texts=new Map();
+  for (const a of actions) if (!(a.node in guards)) guards[a.node]=cache.guard(cache.nodes.get(a.node),texts);
   // Compare meaning and identity. Geometry is always resolved and hit-tested just before input.
   const semantics=actions.map(({rect,...action})=>action);
   const marker=[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
     document.title,text,semantics,page_key[6],page_key[7]];
-  const omitted_actions=Math.max(0,actions.length-250);
-  actions.splice(250);
+  // An offscreen copy of a control already in view (a second toolbar under a table) only adds ambiguity.
+  const inView=new Set(actions.filter(a=>!a.offscreen).map(a=>[a.kind,a.role,a.label,a.section].join('|')));
+  for (let i=actions.length-1; i>=0; i--)
+    if (actions[i].offscreen && inView.has([actions[i].kind,actions[i].role,actions[i].label,actions[i].section].join('|')))
+      actions.splice(i,1);
+  // Keep every control in view and only the 60 nearest offscreen ones: each candidate costs decision time.
+  // Controls revealed by focus count as half a screen away, so nearby boxes below the fold come first.
+  const distance=a=>!a.offscreen ? 0 : a.offscreen==='hidden until focused' ? innerHeight/2 :
+    a.rect.y<0 ? -(a.rect.y+a.rect.h) : Math.max(0,a.rect.y-innerHeight);
+  actions.forEach((a,i)=>a.order=i);
+  actions.sort((a,b)=>!b.offscreen-!a.offscreen || distance(a)-distance(b) || a.order-b.order);
+  const limit=Math.min(250,actions.filter(a=>!a.offscreen).length+60);
+  const omitted_actions=Math.max(0,actions.length-limit);
+  actions.splice(limit);
+  actions.sort((a,b)=>a.order-b.order);
+  actions.forEach(a=>delete a.order);
   actions.forEach((a,i)=>a.id='e'+(i+1));
   if (win.scrollY+win.innerHeight<height-2)
     actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560,...point});
   if (win.scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560,...point});
-  actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
+  let focused=document.activeElement;
+  while (focused?.contentDocument?.activeElement) focused=focused.contentDocument.activeElement;
+  if (focused && focused.matches?.('input,textarea,[contenteditable="true"]') && safe(focused) &&
+      ['textbox','searchbox','combobox','spinbutton'].includes(role(focused)) && focused.tagName!=='TEXTAREA')
+    actions.push({id:'press_enter',kind:'key',key:'Enter',label:'Press Enter in '+(name(focused)||role(focused))});
+    actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
     scroll:{y:win.scrollY,height},actions,marker,page_key,guards,omitted_actions};
 })()

@@ -8,14 +8,31 @@ from .browser import Browser, StalePage
 from .model import action_space, choose, field_context, field_text
 from .questions import MAX_STEPS
 
+STALE_LIMIT = 5
+
+
+def step_goal(plan, index):
+    """The model sees only the current step of an ordered plan, so DONE means that step is finished."""
+    if len(plan) == 1:
+        return plan[0]
+    finished = "".join(f"\n{i + 1}. {step}" for i, step in enumerate(plan[:index]))
+    following = plan[index + 1] if index + 1 < len(plan) else None
+    return (
+        f"Step {index + 1} of {len(plan)}: {plan[index]}"
+        + (f"\n\nAlready finished, do not redo:{finished}" if finished else "")
+        + (f"\n\nNext step, for context only; do not start it: {following}" if following else "")
+        + "\n\nDo every part of this step, then choose DONE as soon as it is visibly finished"
+        + (" (the page is ready for the next step)." if following else ".")
+    )
+
 
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False, cookies=None):
-        task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
-        if not task:
+    def __init__(self, url, goals, *, record_dir=None, screenshots=False, cookies=None, keep_open=False):
+        plan = [goals.strip()] if isinstance(goals, str) else [g.strip() for g in goals if g.strip()]
+        if not plan or not plan[0]:
             raise ValueError("Supply a task")
-        plan = [task]
         self.pending_text = None
+        self.keep_open = keep_open
         self.browser = Browser(url, cookies=cookies)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
@@ -26,13 +43,14 @@ class Agent:
             raise
         self.state = dict(
             browser=self.browser,
-            goal="\n".join(plan),
+            goal=step_goal(plan, 0),
             page=page,
             decision=None,
             history=[],
             status="ready",
             plan=plan,
             plan_index=0,
+            steps_done=[],
             decisions=[],
             text_calls=[],
             elapsed_ms=0,
@@ -59,6 +77,13 @@ class Agent:
             except StalePage:
                 state["decision"] = None
                 state["status"] = "ready"
+                # A target that can never be reached must not spend the whole call budget.
+                last = [d["choice"] for d in state["decisions"][-STALE_LIMIT:]]
+                if len(last) == STALE_LIMIT and len(set(last)) == 1 and last[0] not in {"DONE", "BLOCKED"} and (
+                    not state["history"] or state["history"][-1]["executed_ms"] < state["decisions"][-STALE_LIMIT][
+                        "elapsed_ms"]
+                ):
+                    state["status"] = "blocked"
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
@@ -94,62 +119,54 @@ class Agent:
                 if not state["browser"].fresh(page):
                     state["status"] = "ready"
                     raise StalePage("Page changed since the decision. Choose again.")
-                state["status"] = "done" if selected == "DONE" else "blocked"
-                state["plan_index"] = int(selected == "DONE")
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+                if selected == "BLOCKED":
+                    state["status"] = "blocked"
+                    return self.snapshot()
+                state["steps_done"].append({"step": state["plan_index"] + 1, "elapsed_ms": state["elapsed_ms"]})
+                state["plan_index"] += 1
+                if state["plan_index"] < len(state["plan"]):
+                    state["goal"] = step_goal(state["plan"], state["plan_index"])
+                    state["status"] = "ready"
+                else:
+                    state["status"] = "done"
                 return self.snapshot()
             action = next(a for a in page["actions"] if a["id"] == selected)
             if len(state["history"]) >= MAX_STEPS:
                 state["status"] = "blocked"
                 raise ValueError(f"Stopped at the {MAX_STEPS}-action demo budget")
-            text, helper = None, None
+            text, helper, others = None, None, {}
             if action["kind"] == "fill":
                 if not state["browser"].fresh(page):
                     raise StalePage("Page changed before text generation. Choose again.")
                 context = field_context(state["goal"], action, page, state["history"])
                 if self.pending_text and self.pending_text[0] == context:
-                    _, text, helper = self.pending_text
+                    _, text, helper, others = self.pending_text
                 else:
-                    text, helper = field_text(context)
-                    self.pending_text = (context, text, helper)
-                    state["text_calls"].append({**helper, "field": action["label"], "value": text})
+                    text, helper, others = field_text(context)
+                    self.pending_text = (context, text, helper, others)
+                    state["text_calls"].append({**helper, "field": action["label"], "value": text, "others": others})
             # Browser.act checks freshness immediately before input, including after text generation.
             state["browser"].act(action, page, text=text)
             self.pending_text = None
-            state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
-            # Record execution before observing. A stale post-action observation must not erase the action.
-            state["history"].append(
-                {
-                    "step": len(state["history"]) + 1,
-                    "action": action["label"],
-                    "kind": action["kind"],
-                    "choice": selected,
-                    "probability": decision["probabilities"][selected],
-                    "confidence": decision["confidence"],
-                    "latency_ms": decision["latency_ms"],
-                    "text": text,
-                    "text_helper": helper["model"] if helper else None,
-                    "text_latency_ms": helper["latency_ms"] if helper else 0,
-                    "operation": decision["operation"],
-                    "target": decision["target"],
-                    "page_changed": None,
-                    "url": page["url"],
-                    "usage": decision["usage"],
-                    "executed_ms": round((time.perf_counter() - state["started_at"]) * 1000),
-                    "elapsed_ms": state["elapsed_ms"],
-                }
-            )
-            state["page"] = state["browser"].observe(screenshot=self.screenshots)
-            state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
-            state["history"][-1].update(
-                page_changed=state["page"]["fingerprint"] != page["fingerprint"],
-                url=state["page"]["url"],
-                elapsed_ms=state["elapsed_ms"],
-            )
-            if state["record"]:
-                (self.record_dir / f"{state['elapsed_ms']:06d}.jpg").write_bytes(
-                    base64.b64decode(state["page"]["screenshot"])
+            self.record(action, page, decision, text, helper)
+            # The same helper answer named values for other empty fields; type them without another decision.
+            nodes = {a["id"]: a["node"] for a in page["actions"] if a["kind"] == "fill"}
+            for field_id, value in others.items():
+                current = state["page"]
+                follow = next(
+                    (a for a in current["actions"] if a["kind"] == "fill" and a["node"] == nodes.get(field_id)), None
                 )
+                if follow is None or follow.get("value"):
+                    continue
+                try:
+                    state["browser"].act(follow, current, text=value)
+                except StalePage:
+                    break
+                follow_decision = {**decision, "choice": follow["id"], "probabilities": {follow["id"]: None},
+                                   "latency_ms": 0, "target": None, "usage": {}}
+                # The text call was already counted on the selected field.
+                self.record(follow, current, follow_decision, value, {**helper, "latency_ms": 0})
             repeated = state["history"][-3:]
             state["status"] = (
                 "blocked"
@@ -160,12 +177,51 @@ class Agent:
             raise ValueError("Unknown command")
         return self.snapshot()
 
+    def record(self, action, page, decision, text, helper):
+        """Log an executed action, then observe its result. A stale observation must not erase the action."""
+        state = self.state
+        selected = decision["choice"]
+        state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+        state["history"].append(
+            {
+                "step": len(state["history"]) + 1,
+                "action": action["label"],
+                "kind": action["kind"],
+                "choice": selected,
+                "probability": decision["probabilities"][selected],
+                "confidence": decision["confidence"],
+                "latency_ms": decision["latency_ms"],
+                "text": text,
+                "text_helper": helper["model"] if helper else None,
+                "text_latency_ms": helper["latency_ms"] if helper else 0,
+                "operation": decision["operation"],
+                "target": decision["target"],
+                "page_changed": None,
+                "url": page["url"],
+                "usage": decision["usage"],
+                "executed_ms": state["elapsed_ms"],
+                "elapsed_ms": state["elapsed_ms"],
+            }
+        )
+        state["page"] = state["browser"].observe(screenshot=self.screenshots)
+        state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+        state["history"][-1].update(
+            page_changed=state["page"]["fingerprint"] != page["fingerprint"],
+            url=state["page"]["url"],
+            elapsed_ms=state["elapsed_ms"],
+        )
+        if state["record"]:
+            (self.record_dir / f"{state['elapsed_ms']:06d}.jpg").write_bytes(
+                base64.b64decode(state["page"]["screenshot"])
+            )
+
     def run(self):
         while self.state["status"] not in {"done", "blocked"}:
             yield self.command("tick")
 
     def close(self):
-        self.browser.close()
+        if not self.keep_open:
+            self.browser.close()
 
     def __enter__(self):
         return self

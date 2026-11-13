@@ -58,7 +58,10 @@ def action_space(actions):
         if node not in indices:
             index = str(len(elements) + 1)
             indices[node] = index
-            element = {k: action[k] for k in ("role", "value", "checked", "selected", "expanded") if k in action}
+            element = {
+                k: action[k] for k in ("role", "value", "checked", "selected", "expanded", "section", "offscreen")
+                if k in action
+            }
             element.update(index=index, label=action["label"].split(" → ")[0], operations=[])
             if kind == "select":
                 element["value"] = action.get("current_value", "")
@@ -87,7 +90,10 @@ def choose(state, goal, history):
     }
     operations = {key: labels[key] for key in targets}
     operations.update({key: value["label"] for key, value in controls.items()})
-    operations.update(DONE="Every requirement is visibly satisfied.", BLOCKED="No supported operation can progress.")
+    operations.update(
+        DONE="Every requirement of the goal, or of the current step when steps are given, is visibly satisfied.",
+        BLOCKED="No supported operation can progress.",
+    )
     questions = {
         "operation": {"type": "choice", "criteria": operations, "instructions": {"goal": goal, "rules": NEXT_ACTION}}
     }
@@ -98,7 +104,7 @@ def choose(state, goal, history):
                 index: {
                     "element": f"[{index}] {a['label']}",
                     "current_value": a.get("current_value", a.get("value", "")),
-                    **{k: a[k] for k in ("role", "checked", "selected", "expanded") if k in a},
+                    **{k: a[k] for k in ("role", "checked", "selected", "expanded", "section", "offscreen") if k in a},
                 }
                 for index, a in candidates.items()
             },
@@ -149,9 +155,16 @@ def choose(state, goal, history):
 
 
 def field_context(goal, action, page, history):
+    # Other empty fields, so one answer can fill a whole form. Values the goal does not state come back null.
+    others, seen = [], {action["node"]}
+    for a in page["actions"]:
+        if a["kind"] == "fill" and a["node"] not in seen and not a.get("value") and len(others) < 12:
+            seen.add(a["node"])
+            others.append({k: a.get(k) for k in ("id", "label", "role", "section") if a.get(k)})
     return {
         "goal": goal,
-        "field": {k: action.get(k) for k in ("label", "role", "value")},
+        "field": {k: action.get(k) for k in ("label", "role", "value", "section")},
+        "other_empty_fields": others,
         "page": {"title": page["title"], "text": page["text"][:6000]},
         "recent_actions": [{k: h.get(k) for k in ("action", "text")} for h in history[-6:]],
     }
@@ -187,12 +200,22 @@ def field_text(context):
     try:
         output = json.loads(result["choices"][0]["message"]["content"])
         value = output["text"]
-        if set(output) != {"text"} or not isinstance(value, str) or not value.strip() or len(value) > 2000:
+        others = output.get("other_fields") or {}
+        offered = {f["id"] for f in context.get("other_empty_fields", [])}
+        if (
+            not set(output) <= {"text", "other_fields"} or "text" not in output
+            or not isinstance(value, str) or not value.strip() or len(value) > 2000
+            or not isinstance(others, dict) or not set(others) <= offered
+            or not all(v is None or isinstance(v, str) and len(v) <= 2000 for v in others.values())
+        ):
             raise ValueError()
     except (ValueError, KeyError, TypeError):
         raise ValueError("Text helper returned no valid field value; nothing typed.") from None
+    # Keep context order (page order) and drop fields the goal gave no value for.
+    others = {f["id"]: others[f["id"]] for f in context.get("other_empty_fields", [])
+              if isinstance(others.get(f["id"]), str) and others[f["id"]].strip()}
     return value, {
         "model": model,
         "latency_ms": round((time.perf_counter() - started) * 1000),
         "usage": result.get("usage", {}),
-    }
+    }, others
